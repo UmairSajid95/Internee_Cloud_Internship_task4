@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Internee.pk - CloudWatch monitoring stack: dashboard, alarms (CPU, Response Time,
+  Error Rate, Disk Space via CWAgent), SNS notifications, and encrypted log retention.
+
+Parameters:
+  EC2InstanceId:
+    Type: String
+    Description: Instance ID of the Internee.pk application server
+  ALBFullName:
+    Type: String
+    Description: "ALB dimension value, e.g. app/internee-alb/1234567890abcdef"
+  TargetGroupFullName:
+    Type: String
+    Description: "Target group dimension value, e.g. targetgroup/internee-tg/abcdef1234567890"
+  AlertEmail:
+    Type: String
+    Description: Email address to receive alarm notifications
+  DiskUsedPercentThreshold:
+    Type: Number
+    Default: 85
+    Description: "Alarm threshold for Low Disk Space (% used, from CWAgent)"
+
+Resources:
+
+  ### --- Notifications ---
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: internee-cloudwatch-alarms
+      KmsMasterKeyId: alias/aws/sns
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ### --- Encryption for Logs ---
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for encrypting Internee.pk CloudWatch Logs
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:Describe*
+            Resource: "*"
+
+  LogsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/internee-logs-key
+      TargetKeyId: !Ref LogsKmsKey
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /internee/app
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  NginxErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /internee/nginx-error
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  ### --- Alarms ---
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internee-high-cpu
+      AlarmDescription: "CPU utilization > 80% for 3 consecutive 5-min periods"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2InstanceId
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internee-high-response-time
+      AlarmDescription: "ALB target response time p-avg > 1s for 3 consecutive 5-min periods"
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref ALBFullName
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internee-high-5xx-error-rate
+      AlarmDescription: "ALB 5XX target errors > 5 in a 5-min period"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref ALBFullName
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  LowDiskSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internee-low-disk-space
+      AlarmDescription: "Root volume used_percent (via CloudWatch Agent) exceeds threshold"
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2InstanceId
+        - Name: path
+          Value: "/"
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref DiskUsedPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ### --- Dashboard ---
+  InterneeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Internee-pk-Monitoring
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "CPU Utilization (%)",
+                "metrics": [ [ "AWS/EC2", "CPUUtilization", "InstanceId", "${EC2InstanceId}" ] ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}",
+                "annotations": { "horizontal": [ { "value": 80, "label": "Alarm threshold" } ] }
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Memory Used (%) - via CWAgent",
+                "metrics": [ [ "CWAgent", "mem_used_percent", "InstanceId", "${EC2InstanceId}" ] ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Disk Used (%) - via CWAgent",
+                "metrics": [ [ "CWAgent", "disk_used_percent", "InstanceId", "${EC2InstanceId}", "path", "/" ] ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}",
+                "annotations": { "horizontal": [ { "value": ${DiskUsedPercentThreshold}, "label": "Alarm threshold" } ] }
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 8, "height": 6,
+              "properties": {
+                "title": "Network In/Out (bytes)",
+                "metrics": [
+                  [ "AWS/EC2", "NetworkIn", "InstanceId", "${EC2InstanceId}" ],
+                  [ "AWS/EC2", "NetworkOut", "InstanceId", "${EC2InstanceId}" ]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 6, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB Target Response Time (s)",
+                "metrics": [ [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ALBFullName}", "TargetGroup", "${TargetGroupFullName}" ] ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}",
+                "annotations": { "horizontal": [ { "value": 1, "label": "Alarm threshold" } ] }
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 6, "width": 8, "height": 6,
+              "properties": {
+                "title": "HTTP Error Rates",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${ALBFullName}", "TargetGroup", "${TargetGroupFullName}" ],
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "${ALBFullName}", "TargetGroup", "${TargetGroupFullName}" ]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "alarm", "x": 0, "y": 12, "width": 24, "height": 4,
+              "properties": {
+                "title": "Alarm Status Summary",
+                "alarms": [
+                  "${HighCPUAlarm.Arn}",
+                  "${HighResponseTimeAlarm.Arn}",
+                  "${HighErrorRateAlarm.Arn}",
+                  "${LowDiskSpaceAlarm.Arn}"
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardURL:
+    Description: Direct link to the CloudWatch dashboard
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${InterneeDashboard}"
+  SNSTopicArn:
+    Value: !Ref AlarmTopic
